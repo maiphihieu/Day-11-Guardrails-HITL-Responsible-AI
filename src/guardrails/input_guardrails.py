@@ -3,6 +3,15 @@ Lab 11 — Part 2A: Input Guardrails
   TODO 3: Injection detection (regex)
   TODO 4: Topic filter
   TODO 5: Input Guardrail Plugin (ADK)
+
+WHY INPUT GUARDRAILS ARE NEEDED:
+  Input guardrails are the FIRST content-based defense layer. They run BEFORE
+  the LLM processes the message, which means:
+  1. They prevent malicious prompts from ever reaching the model
+  2. They are fast (regex = O(n)) and don't cost any LLM API tokens
+  3. They catch known attack patterns that would trick the LLM into leaking secrets
+  Without input guardrails, every prompt injection attempt would reach the LLM,
+  increasing the chance of a successful attack AND increasing API costs.
 """
 import re
 
@@ -31,6 +40,12 @@ from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS
 def detect_injection(user_input: str) -> bool:
     """Detect prompt injection patterns in user input.
 
+    WHY: Prompt injection is the #1 attack vector for LLM applications (OWASP LLM01).
+    Attackers try to override the system prompt to make the agent reveal secrets,
+    change its behavior, or execute harmful instructions. Regex-based detection
+    is fast and catches the most common patterns, acting as the first filter
+    before more expensive checks (LLM-as-Judge) run.
+
     Args:
         user_input: The user's message
 
@@ -38,9 +53,17 @@ def detect_injection(user_input: str) -> bool:
         True if injection detected, False otherwise
     """
     INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
+        r"ignore (all )?(previous|above) instructions",
+        r"you are now",
+        r"system prompt",
+        r"reveal your (instructions|prompt|config)",
+        r"pretend you are",
+        r"act as (a |an )?unrestricted",
+        r"override (your |all )?instructions",
+        r"forget (your |all )?(previous |prior )?instructions",
+        r"disregard (all )?(prior |previous )?directives",
+        r"bỏ qua (mọi |tất cả )?hướng dẫn",
+        r"tiết lộ (mật khẩu|password|api key|system prompt)",
     ]
 
     for pattern in INJECTION_PATTERNS:
@@ -62,6 +85,13 @@ def detect_injection(user_input: str) -> bool:
 def topic_filter(user_input: str) -> bool:
     """Check if input is off-topic or contains blocked topics.
 
+    WHY: Even if a message isn't a prompt injection, it might be off-topic
+    (recipe questions, jokes) or contain dangerous topics (weapons, drugs).
+    Off-topic queries waste LLM resources and can be exploited to gradually
+    steer the conversation toward sensitive areas. The topic filter ensures
+    the agent stays focused on banking, which is critical for customer trust
+    and regulatory compliance.
+
     Args:
         user_input: The user's message
 
@@ -70,12 +100,18 @@ def topic_filter(user_input: str) -> bool:
     """
     input_lower = user_input.lower()
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return True
-    # 2. If input doesn't contain any allowed topic -> return True
-    # 3. Otherwise -> return False (allow)
+    # 1. If input contains any blocked topic -> block immediately
+    for topic in BLOCKED_TOPICS:
+        if topic in input_lower:
+            return True
 
-    pass  # Replace with your implementation
+    # 2. If input contains at least one allowed topic -> allow
+    for topic in ALLOWED_TOPICS:
+        if topic in input_lower:
+            return False
+
+    # 3. No allowed topic found -> block as off-topic
+    return True
 
 
 # ============================================================
@@ -90,7 +126,13 @@ def topic_filter(user_input: str) -> bool:
 # ============================================================
 
 class InputGuardrailPlugin(base_plugin.BasePlugin):
-    """Plugin that blocks bad input before it reaches the LLM."""
+    """Plugin that blocks bad input before it reaches the LLM.
+
+    WHY as a plugin (not standalone function): The ADK plugin system allows
+    this guardrail to intercept messages in the pipeline BEFORE the LLM call.
+    This saves API costs (blocked messages never reach Gemini) and provides
+    metrics (blocked_count, total_count) for monitoring.
+    """
 
     def __init__(self):
         super().__init__(name="input_guardrail")
@@ -128,14 +170,24 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If True: increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If True: increment blocked_count, return self._block_response("...")
-        # 3. If both are False: return None (let message through)
+        # 1. Check for prompt injection
+        if detect_injection(text):
+            self.blocked_count += 1
+            return self._block_response(
+                "[BLOCKED] Request blocked: Potential prompt injection detected. "
+                "I can only help with banking-related questions."
+            )
 
-        pass  # Replace with your implementation
+        # 2. Check for off-topic or blocked topics
+        if topic_filter(text):
+            self.blocked_count += 1
+            return self._block_response(
+                "[BLOCKED] Request blocked: This topic is outside my scope. "
+                "I'm a VinBank assistant and can only help with banking questions."
+            )
+
+        # 3. Both checks passed — let message through
+        return None
 
 
 # ============================================================
